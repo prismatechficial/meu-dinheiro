@@ -25,7 +25,15 @@ const DEFAULT_CATS = [
   { name: 'Assinaturas', icon: '📺', group: 'est', fixed: true, w: 3 },
   { name: 'Outros', icon: '📦', group: 'est', fixed: false, w: 6 },
 ];
-const INCOME_SOURCES = ['Salário', 'Clientes / vendas', 'Extra', 'Outros'];
+const GOAL_OPTS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70];
+const goalCustomField = (id, val) => `<div class="row" style="margin-top:10px"><span class="small muted grow">Outro valor:</span>
+  <input class="in-f num" id="${id}" inputmode="decimal" placeholder="ex.: 12" value="${val}" style="width:90px;text-align:right;padding:9px 10px"><span class="muted">%</span></div>`;
+// aceita de 1% a 90%, com até 1 casa decimal (ex.: 12,5)
+function parseGoal(s) {
+  const v = parseFloat(String(s).replace(',', '.'));
+  return isFinite(v) && v >= 1 && v <= 90 ? Math.round(v * 10) / 10 : null;
+}
+const INCOME_SOURCES =['Salário', 'Clientes / vendas', 'Extra', 'Outros'];
 const ICONS = ['🏠', '🛒', '🚗', '💡', '💊', '📚', '🎉', '🍔', '🛍️', '📺', '📦', '🐶', '👶', '💳', '✈️', '💼', '🎁', '⛽', '💇', '📱'];
 
 // ---------- estado ----------
@@ -35,11 +43,39 @@ let ui = { tab: 'home', month: ym(new Date()), filter: 'all' };
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(KEY));
-    if (s && s.categories) return s;
+    if (s && s.categories) {
+      if (!Array.isArray(s.pots)) s.pots = defaultPots(s.goalPct || 20); // dados da versão anterior
+      return s;
+    }
   } catch (e) { /* começa do zero */ }
-  return { setupDone: false, income: 0, goalPct: 20, categories: [], tx: [] };
+  return { setupDone: false, income: 0, goalPct: 20, categories: [], pots: defaultPots(20), tx: [] };
 }
 function save() { localStorage.setItem(KEY, JSON.stringify(S)); }
+
+// ---------- destinos do dinheiro guardado ----------
+const POT_ICONS = ['🛟', '📈', '🏦', '✈️', '🎓', '🏡', '🚗', '🎁', '👶', '💍'];
+function round1(v) { return Math.round(v * 10) / 10; }
+function defaultPots(total) {
+  const half = round1(total / 2);
+  return [
+    { id: uid(), name: 'Reserva de emergência', icon: '🛟', pct: half },
+    { id: uid(), name: 'Investimentos', icon: '📈', pct: round1(total - half) },
+  ];
+}
+// A meta total de sobra é sempre a soma dos destinos.
+function syncGoal() { if (S.pots.length) S.goalPct = round1(S.pots.reduce((a, p) => a + p.pct, 0)); }
+// Mudar a meta total reparte proporcionalmente entre os destinos.
+function setGoalTotal(total) {
+  const sum = S.pots.reduce((a, p) => a + p.pct, 0);
+  if (S.pots.length) {
+    S.pots.forEach((p) => { p.pct = sum > 0 ? round1((p.pct * total) / sum) : round1(total / S.pots.length); });
+    S.pots[0].pct = round1(S.pots[0].pct + total - S.pots.reduce((a, p) => a + p.pct, 0));
+  }
+  S.goalPct = total;
+}
+const potValue = (p) => Math.round(S.income * p.pct) / 100;
+const pctOfIncome = (v) => (S.income > 0 ? round1((v / S.income) * 100) : 0);
+const fmtPct = (v) => String(v).replace('.', ',');
 
 function goal() { return Math.round(S.income * S.goalPct) / 100; }
 function spendable() { return Math.max(0, S.income - goal()); }
@@ -305,7 +341,7 @@ function viewPlan() {
   const pc = (v) => Math.round((v / inc) * 100) + '%';
 
   const steps = [
-    { t: `Separe ${money(g)} assim que o dinheiro entrar`, x: 'Transfira para uma conta separada ou investimento no dia em que receber. O que sobra é o que você pode gastar — não o contrário.' },
+    { t: `Separe ${money(g)} assim que o dinheiro entrar`, x: (S.pots.length ? S.pots.map((p) => `${p.icon} ${p.name}: ${money(potValue(p))}`).join(' · ') + '. ' : '') + 'Faça as transferências no dia em que receber. O que sobra é o que você pode gastar — não o contrário.' },
     { t: `Pague os gastos fixos: ${money(fixedTotal)}`, x: fixed.map((c) => `${c.icon} ${c.name}: ${money(c.budget)}`).join(' · ') || 'Nenhum gasto fixo cadastrado.' },
     { t: `Gasto do dia a dia: até ${money(varTotal / st.dim)} por dia`, x: `Isso dá ${money((varTotal / st.dim) * 7)} por semana para ${variable.map((c) => c.name.toLowerCase()).slice(0, 4).join(', ')}${variable.length > 4 ? ' e outros' : ''}.` },
     { t: 'Registre cada gasto no mesmo dia', x: 'Leva 5 segundos no botão +. Sem registro, o app não consegue te avisar a tempo.' },
@@ -333,17 +369,30 @@ function viewPlan() {
 function viewBudget() {
   const sum = S.categories.reduce((a, c) => a + c.budget, 0);
   const diff = spendable() - sum;
-  const rows = S.categories.map((c) => `<div class="bud"><span style="font-size:20px">${c.icon}</span>
-    <div class="grow"><div style="font-weight:600;font-size:15px">${esc(c.name)}</div><div class="small muted">${c.group === 'ess' ? 'Essencial' : 'Estilo de vida'}${c.fixed ? ' · fixo' : ''}</div></div>
-    <input class="in-f num" inputmode="decimal" data-bud="${c.id}" value="${fmtInput(c.budget)}">
-    <button class="x" data-delcat="${c.id}" aria-label="Remover">×</button></div>`).join('');
+  const pairRow = (icon, name, sub, pct, value, pctAttr, valAttr, delAttr) => `<div class="bud2">
+    <div class="row"><span style="font-size:20px">${icon}</span>
+      <div class="grow"><div style="font-weight:600;font-size:15px">${esc(name)}</div><div class="small muted">${sub}</div></div>
+      <button class="x" ${delAttr} aria-label="Remover">×</button></div>
+    <div class="pair"><input class="in-f num" inputmode="decimal" ${pctAttr} value="${fmtPct(pct)}"><span class="muted small">% da renda</span>
+      <span class="muted small" style="margin-left:auto">R$</span><input class="in-f num" inputmode="decimal" ${valAttr} value="${fmtInput(value)}"></div></div>`;
+  const rows = S.categories.map((c) => pairRow(c.icon, c.name, (c.group === 'ess' ? 'Essencial' : 'Estilo de vida') + (c.fixed ? ' · conta fixa' : ''),
+    pctOfIncome(c.budget), c.budget, `data-budpct="${c.id}"`, `data-bud="${c.id}"`, `data-delcat="${c.id}"`)).join('');
+  const pots = S.pots.map((p) => pairRow(p.icon, p.name, 'Guardar todo mês', p.pct, potValue(p),
+    `data-potpct="${p.id}"`, `data-potval="${p.id}"`, `data-delpot="${p.id}"`)).join('');
   return `<h1>Orçamento mensal</h1>
   <div class="card">
     <label class="f" style="margin-top:0">Quanto você ganha por mês (renda prevista)</label>
     <input class="in-f num" id="inc" inputmode="decimal" value="${fmtInput(S.income)}">
     <label class="f">Quanto quer sobrar por mês</label>
-    <div class="chips" id="goalChips">${[10, 15, 20, 25, 30, 40].map((p) => `<button class="chip ${S.goalPct === p ? 'on' : ''}" data-goal="${p}">${p}%</button>`).join('')}</div>
+    <div class="chips" id="goalChips">${GOAL_OPTS.map((p) => `<button class="chip ${S.goalPct === p ? 'on' : ''}" data-goal="${p}">${p}%</button>`).join('')}</div>
+    ${goalCustomField('goalCustom', GOAL_OPTS.includes(S.goalPct) ? '' : fmtPct(S.goalPct))}
     <div class="small muted" style="margin-top:10px">Meta: <b>${money(goal())}</b> por mês · Para gastar: <b>${money(spendable())}</b></div>
+  </div>
+  <h2>Para onde vai o que você guarda</h2>
+  <div class="card">
+    <div class="small muted" style="margin-bottom:4px">Defina quanto da renda vai para cada objetivo. A soma vira sua meta de sobra (${fmtPct(S.goalPct)}%).</div>
+    ${pots || '<div class="empty">Nenhum destino. Toque abaixo para criar.</div>'}
+    <button class="btn ghost" data-act="newpot">+ Novo destino (viagem, carro, aposentadoria…)</button>
   </div>
   <h2>Limite por categoria</h2>
   <div class="card">
@@ -370,7 +419,8 @@ function renderOnboarding() {
       <input class="in-f money num" id="oInc" inputmode="decimal" placeholder="R$ 0,00">
       <div class="small muted" style="margin-top:6px">Some salário, clientes e outras rendas. Pode ser uma média.</div>
       <label class="f">Quanto quer sobrar todo mês?</label>
-      <div class="chips" id="oGoal">${[10, 15, 20, 25, 30, 40].map((p) => `<button class="chip ${p === 20 ? 'on' : ''}" data-ogoal="${p}">${p}%</button>`).join('')}</div>
+      <div class="chips" id="oGoal">${GOAL_OPTS.map((p) => `<button class="chip ${p === 20 ? 'on' : ''}" data-ogoal="${p}">${p}%</button>`).join('')}</div>
+      ${goalCustomField('oGoalCustom', '')}
       <div class="small muted" id="oHint" style="margin-top:10px"></div>
       <button class="btn" data-act="start">Criar meu plano</button>
     </div></div>`;
@@ -384,12 +434,20 @@ function renderOnboarding() {
     const b = e.target.closest('[data-ogoal]'); if (!b) return;
     pct = Number(b.dataset.ogoal);
     document.querySelectorAll('[data-ogoal]').forEach((x) => x.classList.toggle('on', x === b));
+    $('#oGoalCustom').value = '';
+    hint();
+  });
+  $('#oGoalCustom').addEventListener('input', (e) => {
+    const p = parseGoal(e.target.value);
+    if (p === null) return;
+    pct = p;
+    document.querySelectorAll('[data-ogoal]').forEach((x) => x.classList.toggle('on', Number(x.dataset.ogoal) === p));
     hint();
   });
   $('[data-act="start"]').addEventListener('click', () => {
     const v = parseMoney($('#oInc').value);
     if (!(v > 0)) { toast('Informe quanto você ganha por mês'); $('#oInc').focus(); return; }
-    S.income = v; S.goalPct = pct; S.setupDone = true;
+    S.income = v; S.goalPct = pct; S.pots = defaultPots(pct); S.setupDone = true;
     S.categories = DEFAULT_CATS.map((c) => ({ id: uid(), ...c, budget: 0 }));
     distribute(); save(); render();
     toast('Plano criado! Toque no + para registrar gastos');
@@ -400,7 +458,8 @@ function renderOnboarding() {
 function openSheet(html) {
   $('#sheet').innerHTML = '<div class="grab"></div>' + html;
   $('#sheetBg').classList.add('open');
-  requestAnimationFrame(() => $('#sheet').classList.add('open'));
+  void $('#sheet').offsetWidth; // força o navegador a aplicar a posição inicial antes da animação
+  $('#sheet').classList.add('open');
 }
 function closeSheet() { $('#sheet').classList.remove('open'); $('#sheetBg').classList.remove('open'); }
 
@@ -447,6 +506,36 @@ function txSheet(id) {
     } else if (b.id === 'txDel') {
       if (!confirm('Excluir este lançamento?')) return;
       S.tx = S.tx.filter((x) => x.id !== t.id); save(); closeSheet(); render(); toast('Lançamento excluído');
+    }
+  };
+}
+
+function newPotSheet() {
+  let icon = POT_ICONS[2];
+  openSheet(`<h1 style="margin-top:0">Novo destino para guardar</h1>
+    <label class="f">Nome</label><input class="in-f" id="npName" maxlength="30" placeholder="Ex.: Viagem, Carro novo, Aposentadoria">
+    <label class="f">Ícone</label><div class="chips" id="npIcons"></div>
+    <label class="f">Quanto da renda guardar por mês</label>
+    <div class="chips" id="npChips">${[1, 2, 3, 5, 10, 15, 20].map((p) => `<button class="chip" data-nppct="${p}">${p}%</button>`).join('')}</div>
+    <div class="row" style="margin-top:10px"><input class="in-f num" id="npPct" inputmode="decimal" placeholder="0" style="width:90px;text-align:right"><span class="muted">%</span>
+      <span class="small muted grow" id="npHint" style="text-align:right"></span></div>
+    <button class="btn" id="npSave">Criar destino</button>`);
+  const hint = () => { $('#npHint').textContent = `= ${money(S.income * parseMoney($('#npPct').value) / 100)} por mês`; };
+  const draw = () => { $('#npIcons').innerHTML = POT_ICONS.map((i) => `<button class="chip ${i === icon ? 'on' : ''}" data-ic="${i}">${i}</button>`).join(''); };
+  draw(); hint();
+  $('#npPct').addEventListener('input', hint);
+  $('#sheet').onclick = (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.ic) { icon = b.dataset.ic; draw(); }
+    else if (b.dataset.nppct) { $('#npPct').value = b.dataset.nppct; hint(); }
+    else if (b.id === 'npSave') {
+      const name = $('#npName').value.trim();
+      const pct = parseMoney($('#npPct').value);
+      if (!name) { toast('Dê um nome'); return; }
+      if (!(pct > 0) || S.goalPct + pct > 90) { toast('Escolha um % válido'); return; }
+      S.pots.push({ id: uid(), name, icon, pct: round1(pct) });
+      syncGoal(); save(); closeSheet(); render();
+      toast(`Meta de sobra agora: ${fmtPct(S.goalPct)}%. Toque em "Redistribuir" para ajustar os limites.`);
     }
   };
 }
@@ -521,7 +610,7 @@ document.addEventListener('click', (e) => {
   if (b.dataset.tab) { ui.tab = b.dataset.tab; render(); return; }
   if (b.dataset.edit) { txSheet(b.dataset.edit); return; }
   if (b.dataset.filter) { ui.filter = b.dataset.filter; render(); return; }
-  if (b.dataset.goal) { S.goalPct = Number(b.dataset.goal); save(); render(); toast(`Meta: sobrar ${money(goal())}. Toque em "Redistribuir" para ajustar os limites.`); return; }
+  if (b.dataset.goal) { setGoalTotal(Number(b.dataset.goal)); save(); render(); toast(`Meta: sobrar ${money(goal())}. Toque em "Redistribuir" para ajustar os limites.`); return; }
   if (b.dataset.delcat) {
     const c = S.categories.find((x) => x.id === b.dataset.delcat);
     if (confirm(`Remover a categoria "${c.name}"? Os gastos já lançados nela continuam contando no total.`)) {
@@ -529,7 +618,15 @@ document.addEventListener('click', (e) => {
     }
     return;
   }
+  if (b.dataset.delpot) {
+    const p = S.pots.find((x) => x.id === b.dataset.delpot);
+    if (confirm(`Remover o destino "${p.name}"? A meta de sobra diminui ${fmtPct(p.pct)}%.`)) {
+      S.pots = S.pots.filter((x) => x !== p); syncGoal(); save(); render();
+    }
+    return;
+  }
   switch (b.dataset.act) {
+    case 'newpot': newPotSheet(); break;
     case 'prev': ui.month = shiftMonth(ui.month, -1); render(); break;
     case 'next': ui.month = shiftMonth(ui.month, 1); render(); break;
     case 'add': txSheet(null); break;
@@ -543,10 +640,28 @@ document.addEventListener('click', (e) => {
   }
 });
 document.addEventListener('change', (e) => {
+  if (e.target.id === 'goalCustom') {
+    const p = parseGoal(e.target.value);
+    if (p === null) { toast('Digite um valor entre 1 e 90%'); return; }
+    setGoalTotal(p); save(); render(); toast(`Meta: sobrar ${money(goal())} (${p}%). Toque em "Redistribuir" para ajustar os limites.`);
+  }
   if (e.target.id === 'inc') { S.income = parseMoney(e.target.value); save(); render(); toast('Renda atualizada. Toque em "Redistribuir" para ajustar os limites.'); }
-  if (e.target.dataset && e.target.dataset.bud) {
-    const c = S.categories.find((x) => x.id === e.target.dataset.bud);
+  const d = e.target.dataset || {};
+  if (d.bud) {
+    const c = S.categories.find((x) => x.id === d.bud);
     c.budget = parseMoney(e.target.value); save(); render();
+  }
+  if (d.budpct) {
+    const c = S.categories.find((x) => x.id === d.budpct);
+    c.budget = Math.round(S.income * Math.min(100, parseMoney(e.target.value))) / 100; save(); render();
+  }
+  if (d.potpct || d.potval) {
+    const p = S.pots.find((x) => x.id === (d.potpct || d.potval));
+    const pct = d.potpct ? parseMoney(e.target.value) : pctOfIncome(parseMoney(e.target.value));
+    const others = S.pots.reduce((a, x) => a + (x === p ? 0 : x.pct), 0);
+    p.pct = round1(Math.max(0, Math.min(90 - others, pct)));
+    syncGoal(); save(); render();
+    toast(`Meta de sobra agora: ${fmtPct(S.goalPct)}% (${money(goal())}). Toque em "Redistribuir" para ajustar os limites.`);
   }
 });
 $('#sheetBg').addEventListener('click', closeSheet);
