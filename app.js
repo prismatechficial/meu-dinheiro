@@ -286,7 +286,7 @@ function insights(st) {
 function render() {
   if (!S.setupDone) { renderOnboarding(); $('#tabs').innerHTML = ''; return; }
   renderTabs();
-  const v = { home: viewHome, tx: viewTx, plan: viewPlan, budget: viewBudget, read: viewRead }[ui.tab];
+  const v = { home: viewHome, tx: viewTx, plan: viewPlan, budget: viewBudget, read: viewRead, avg: viewAvg }[ui.tab];
   $('#app').innerHTML = v();
   window.scrollTo(0, 0);
 }
@@ -353,6 +353,7 @@ function viewHome() {
   ${daily}
   <h2>O que fazer agora</h2>${ins}
   ${insights(st).length > 3 ? `<button class="btn ghost" data-tab="plan" style="margin-top:0">Ver plano completo</button>` : ''}
+  ${avgCard()}
   ${readCard()}
   ${incRows ? `<h2>Entradas e metas de lucro</h2><div class="card">${incRows}</div>` : ''}
   <h2>Limites por categoria</h2><div class="card">${cats || '<div class="empty">Sem categorias</div>'}</div>`;
@@ -382,6 +383,7 @@ function viewTx() {
   return `${monthBar()}
   <div class="kpis"><div class="card"><span class="small muted">Entradas</span><b class="num in">${money(st.income)}</b></div>
   <div class="card"><span class="small muted">Saídas</span><b class="num">${money(st.spent)}</b></div></div>
+  <button class="btn ghost" data-tab="avg" style="margin-top:10px">📊 Ver média de entradas dos últimos 4 meses</button>
   <div class="seg" style="margin:14px 0 4px">${f('all', 'Todos')}${f('out', 'Saídas')}${f('in', 'Entradas')}</div>
   ${html || '<div class="empty">Nenhum lançamento neste mês.<br>Toque no + para adicionar.</div>'}`;
 }
@@ -466,6 +468,103 @@ function bookRow(b) {
     <div class="grow" style="min-width:0"><div class="row between"><b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.title)}</b>${tag}</div>
     <div class="small muted">${b.author ? esc(b.author) + ' · ' : ''}pág. ${b.current || 0} de ${b.pages}${b.notes && b.notes.length ? ` · ${b.notes.length} anotaç${b.notes.length > 1 ? 'ões' : 'ão'}` : ''}</div>
     <div class="bar"><i style="width:${p * 100}%;background:${b.finished ? 'var(--good)' : 'var(--info)'}"></i></div></div></button>`;
+}
+
+// ---------- média de entradas dos últimos 4 meses ----------
+// De onde veio cada entrada: o item (Salário, Serviços…) ou, nos serviços, o nome do cliente/trabalho na descrição.
+function sourceKey(t) {
+  const it = S.incomes.find((i) => i.id === t.src);
+  if (it && it.kind === 'variavel' && t.desc) return t.desc.split(' — ')[0].trim();
+  return incomeName(t.src);
+}
+function avgStats(endM, n = 4) {
+  const months = [];
+  for (let k = n - 1; k >= 0; k--) months.push(shiftMonth(endM, -k));
+  const cur = ym(new Date());
+  const rows = months.map((m) => {
+    const ins = S.tx.filter((t) => t.type === 'in' && t.date.startsWith(m));
+    const fixo = ins.filter((t) => (S.incomes.find((i) => i.id === t.src) || {}).kind === 'fixo').reduce((a, t) => a + t.amount, 0);
+    const total = ins.reduce((a, t) => a + t.amount, 0);
+    return { m, total, fixo, varia: total - fixo, partial: m === cur, future: m > cur };
+  });
+  const used = rows.filter((r) => r.total > 0 && !r.future);
+  const k = used.length || 1;
+  const avg = used.reduce((a, r) => a + r.total, 0) / k;
+  const avgFixo = used.reduce((a, r) => a + r.fixo, 0) / k;
+  const avgVar = used.reduce((a, r) => a + r.varia, 0) / k;
+  const best = used.reduce((a, r) => (!a || r.total > a.total ? r : a), null);
+  const worst = used.reduce((a, r) => (!a || r.total < a.total ? r : a), null);
+  const src = {};
+  S.tx.filter((t) => t.type === 'in' && used.some((r) => t.date.startsWith(r.m))).forEach((t) => {
+    const key = sourceKey(t);
+    src[key] = src[key] || { name: key, total: 0, months: new Set() };
+    src[key].total += t.amount; src[key].months.add(t.date.slice(0, 7));
+  });
+  const sources = Object.values(src).sort((a, b) => b.total - a.total);
+  return { months, rows, used, avg, avgFixo, avgVar, best, worst, sources };
+}
+
+function avgCard() {
+  const a = avgStats(ui.month);
+  if (!a.used.length) return '';
+  return `<button class="card daily" data-tab="avg" style="width:100%;text-align:left">
+    <div class="ico">📊</div><div class="grow"><div class="small muted">Média de entradas · últimos 4 meses</div>
+    <div class="v num" style="font-size:20px">${money(a.avg)}</div>
+    <div class="small muted">Fixo ${money(a.avgFixo)} + trabalhos ${money(a.avgVar)} · toque para ver</div></div></button>`;
+}
+
+function viewAvg() {
+  const a = avgStats(ui.month);
+  const short = (m) => { const s = monthName(m).split(' '); return s[0].slice(0, 3) + '/' + s[2].slice(2); };
+  const max = Math.max(1, ...a.rows.map((r) => r.total));
+  const bars = a.rows.map((r) => `<div style="margin:12px 0">
+    <div class="row between small"><b>${monthName(r.m).split(' ')[0]}${r.partial ? ' <span class="muted" style="font-weight:400">(em andamento)</span>' : ''}</b>
+      <span class="num ${r.total >= a.avg ? 'in' : ''}" style="font-weight:650">${money(r.total)}</span></div>
+    <div class="bar" style="height:14px;display:flex"><i style="width:${(r.fixo / max) * 100}%;background:var(--good);border-radius:99px 0 0 99px"></i><i style="width:${(r.varia / max) * 100}%;background:var(--info);border-radius:0 99px 99px 0"></i></div>
+    </div>`).join('');
+  const n = a.used.length;
+  const plan = S.income;
+  const vg = variableGoal();
+  const vars = S.incomes.filter((i) => i.kind === 'variavel');
+  let compare = '';
+  if (plan > 0 && n) {
+    const d = plan - a.avg;
+    if (d > a.avg * 0.05) {
+      compare = `<div class="ins warn"><div class="n">⚠️</div><div><div class="t">Seu plano conta com ${money(d)} a mais do que você costuma receber</div>
+        <div class="x">Renda prevista: ${money(plan)} · média real: ${money(a.avg)}. Se os trabalhos não renderem acima da média, a sobra do mês fica menor que a meta.</div></div></div>`;
+    } else if (-d > a.avg * 0.05) {
+      compare = `<div class="ins good"><div class="n">💪</div><div><div class="t">Você costuma receber ${money(-d)} a mais do que o planejado</div>
+        <div class="x">Renda prevista: ${money(plan)} · média real: ${money(a.avg)}. Dá para aumentar a meta de sobra ou de investimentos.</div></div></div>`;
+    } else {
+      compare = `<div class="ins good"><div class="n">✅</div><div><div class="t">Seu plano está realista</div><div class="x">Renda prevista de ${money(plan)}, bem perto da média real de ${money(a.avg)}.</div></div></div>`;
+    }
+  }
+  const useBtn = vars.length === 1 && n && Math.abs(vars[0].amount - a.avgVar) >= 10
+    ? `<button class="btn ghost" data-act="useavg">Usar ${money(Math.round(a.avgVar / 10) * 10)} como meta de "${esc(vars[0].name)}"</button>` : '';
+  const srcRows = a.sources.map((s) => `<div class="bud"><div class="grow"><div style="font-weight:600">${esc(s.name)}</div>
+    <div class="small muted">${s.months.size} de ${n} ${n === 1 ? 'mês' : 'meses'} · média ${money(s.total / n)}/mês</div></div>
+    <b class="num">${money(s.total)}</b></div>`).join('');
+  return `${monthBar()}
+  <div class="row" style="margin:-4px 0 6px"><button class="chip" data-tab="home">‹ Voltar</button></div>
+  <h1>Média de entradas</h1>
+  <div class="card hero">
+    <div class="lbl">Média por mês · ${short(a.months[0])} a ${short(a.months[3])}</div>
+    <div class="big num">${money(a.avg)}</div>
+    <div class="split">
+      <div><span class="small">Fixo (salário…)</span><b class="num">${money(a.avgFixo)}</b></div>
+      <div><span class="small">Trabalhos</span><b class="num">${money(a.avgVar)}</b></div>
+    </div>
+    <div class="small" style="margin-top:10px;opacity:.9">${n ? `Calculado com ${n} ${n === 1 ? 'mês' : 'meses'} com entradas registradas.` : 'Nenhuma entrada registrada nesses meses.'}</div>
+  </div>
+  ${n ? `<div class="kpis">
+    <div class="card"><span class="small muted">Melhor mês</span><b class="num in">${money(a.best.total)}</b><span class="small muted">${monthName(a.best.m).split(' ')[0]}</span></div>
+    <div class="card"><span class="small muted">Mês mais fraco</span><b class="num">${money(a.worst.total)}</b><span class="small muted">${monthName(a.worst.m).split(' ')[0]}</span></div></div>` : ''}
+  <h2>Mês a mês</h2>
+  <div class="card">${bars}
+    <div class="row small muted" style="gap:14px;margin-top:6px"><span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:var(--good)"></span> Fixo</span>
+      <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:var(--info)"></span> Trabalhos</span></div></div>
+  ${compare ? `<h2>Comparando com seu plano</h2>${compare}${useBtn}` : ''}
+  ${srcRows ? `<h2>De onde veio o dinheiro</h2><div class="card">${srcRows}</div>` : ''}`;
 }
 
 function viewRead() {
@@ -930,6 +1029,15 @@ document.addEventListener('click', (e) => {
   }
   if (b.dataset.book) { bookSheet(b.dataset.book); return; }
   if (b.dataset.readgoal) { S.readGoal = Number(b.dataset.readgoal); save(); render(); return; }
+  if (b.dataset.act === 'useavg') {
+    const v = S.incomes.filter((i) => i.kind === 'variavel');
+    if (v.length !== 1) return;
+    const val = Math.round(avgStats(ui.month).avgVar / 10) * 10;
+    if (!confirm(`Mudar a meta de "${v[0].name}" para ${money(val)} por mês?`)) return;
+    v[0].amount = val; syncIncome(); save(); render();
+    toast(`Meta atualizada. Renda prevista: ${money(S.income)}. Toque em "Redistribuir" no Orçamento para ajustar os limites.`);
+    return;
+  }
   switch (b.dataset.act) {
     case 'newbook': bookFormSheet(null); break;
     case 'newpot': newPotSheet(); break;
