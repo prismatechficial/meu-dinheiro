@@ -45,10 +45,12 @@ function load() {
     if (s && s.categories) {
       if (!Array.isArray(s.pots)) s.pots = defaultPots(s.goalPct || 20); // dados da versão anterior
       if (!Array.isArray(s.incomes)) s.incomes = s.income > 0 ? [{ id: uid(), name: 'Salário', kind: 'fixo', amount: s.income }] : [];
+      if (!Array.isArray(s.books)) s.books = [];
+      if (!(s.readGoal > 0)) s.readGoal = 1;
       return s;
     }
   } catch (e) { /* começa do zero */ }
-  return { setupDone: false, income: 0, goalPct: 20, categories: [], pots: defaultPots(20), incomes: [], tx: [] };
+  return { setupDone: false, income: 0, goalPct: 20, categories: [], pots: defaultPots(20), incomes: [], tx: [], books: [], readGoal: 1 };
 }
 
 // ---------- entradas: salário, valores fixos e serviços variáveis ----------
@@ -284,7 +286,7 @@ function insights(st) {
 function render() {
   if (!S.setupDone) { renderOnboarding(); $('#tabs').innerHTML = ''; return; }
   renderTabs();
-  const v = { home: viewHome, tx: viewTx, plan: viewPlan, budget: viewBudget }[ui.tab];
+  const v = { home: viewHome, tx: viewTx, plan: viewPlan, budget: viewBudget, read: viewRead }[ui.tab];
   $('#app').innerHTML = v();
   window.scrollTo(0, 0);
 }
@@ -296,8 +298,8 @@ function monthBar() {
 
 function renderTabs() {
   const t = (id, ic, l) => `<button data-tab="${id}" class="${ui.tab === id ? 'on' : ''}"><span>${ic}</span>${l}</button>`;
-  $('#tabs').innerHTML = t('home', '🏠', 'Início') + t('tx', '📄', 'Lançamentos') +
-    `<button class="fab" data-act="add" aria-label="Novo lançamento">+</button>` +
+  $('#tabs').innerHTML = t('home', '🏠', 'Início') + t('tx', '📄', 'Extrato') + t('read', '📚', 'Leitura') +
+    `<button class="fab" data-act="${ui.tab === 'read' ? 'newbook' : 'add'}" aria-label="${ui.tab === 'read' ? 'Novo livro' : 'Novo lançamento'}">+</button>` +
     t('plan', '🎯', 'Plano') + t('budget', '🧮', 'Orçamento');
 }
 
@@ -351,6 +353,7 @@ function viewHome() {
   ${daily}
   <h2>O que fazer agora</h2>${ins}
   ${insights(st).length > 3 ? `<button class="btn ghost" data-tab="plan" style="margin-top:0">Ver plano completo</button>` : ''}
+  ${readCard()}
   ${incRows ? `<h2>Entradas e metas de lucro</h2><div class="card">${incRows}</div>` : ''}
   <h2>Limites por categoria</h2><div class="card">${cats || '<div class="empty">Sem categorias</div>'}</div>`;
 }
@@ -424,6 +427,159 @@ function viewPlan() {
     ${splitRow('Guardar / investir', g, '20% ou mais', 'var(--good)')}
     <div class="small muted" style="margin-top:8px">Regra 50/30/20: no máximo metade da renda no essencial, até 30% em desejos e pelo menos 20% guardado.${ess / inc > 0.55 ? ' Seus essenciais estão acima de 50% — vale rever moradia, transporte ou contas.' : ''}</div>
   </div>`;
+}
+
+// ---------- leitura: meta de livros por mês ----------
+const bookPct = (b) => (b.pages > 0 ? Math.min(1, (b.current || 0) / b.pages) : 0);
+const finishedIn = (m) => S.books.filter((b) => b.finished && b.finished.startsWith(m));
+function readStats(m) {
+  const st = stats(m);
+  const done = finishedIn(m).length;
+  const reading = S.books.filter((b) => !b.finished).sort((a, b) => bookPct(b) - bookPct(a));
+  const main = reading[0];
+  const left = main ? Math.max(0, main.pages - (main.current || 0)) : 0;
+  const perDay = main && st.status === 'current' && st.daysLeft > 0 ? Math.ceil(left / st.daysLeft) : 0;
+  return { st, done, reading, main, left, perDay, goal: S.readGoal };
+}
+
+function readCard() {
+  const r = readStats(ui.month);
+  if (!S.books.length && r.st.status !== 'current') return '';
+  const ok = r.done >= r.goal;
+  let x;
+  if (ok) x = 'Meta de leitura do mês batida! 🎉';
+  else if (r.main && r.st.status === 'current') x = `${esc(r.main.title)}: página ${r.main.current || 0} de ${r.main.pages} · ${r.perDay} pág./dia para terminar no mês`;
+  else if (r.st.status === 'current') x = 'Toque para escolher o livro do mês';
+  else x = `${r.done} de ${r.goal} livro${r.goal > 1 ? 's' : ''} concluído${r.goal > 1 ? 's' : ''}`;
+  return `<button class="card daily" data-tab="read" style="width:100%;text-align:left">
+    <div class="ico">📚</div><div class="grow"><div class="small muted">Leitura do mês</div>
+    <div class="v num" style="font-size:20px">${r.done} de ${r.goal} livro${r.goal > 1 ? 's' : ''}</div>
+    <div class="small muted">${x}</div>
+    ${r.main && !ok ? `<div class="bar"><i style="width:${bookPct(r.main) * 100}%;background:var(--info)"></i></div>` : ''}</div></button>`;
+}
+
+function bookRow(b) {
+  const p = bookPct(b);
+  const tag = b.finished ? `<span class="tag good">concluído ${new Date(b.finished + 'T12:00').toLocaleDateString('pt-BR', { month: 'short' }).replace('.', '')}/${b.finished.slice(2, 4)}</span>`
+    : `<span class="tag info">${Math.round(p * 100)}%</span>`;
+  return `<button class="tx" data-book="${b.id}"><div class="em" style="width:40px;height:52px;border-radius:8px;display:grid;place-items:center;background:var(--bg);font-size:22px;flex:none">${b.finished ? '✅' : '📖'}</div>
+    <div class="grow" style="min-width:0"><div class="row between"><b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.title)}</b>${tag}</div>
+    <div class="small muted">${b.author ? esc(b.author) + ' · ' : ''}pág. ${b.current || 0} de ${b.pages}${b.notes && b.notes.length ? ` · ${b.notes.length} anotaç${b.notes.length > 1 ? 'ões' : 'ão'}` : ''}</div>
+    <div class="bar"><i style="width:${p * 100}%;background:${b.finished ? 'var(--good)' : 'var(--info)'}"></i></div></div></button>`;
+}
+
+function viewRead() {
+  const r = readStats(ui.month);
+  const year = ui.month.slice(0, 4);
+  const yearDone = S.books.filter((b) => b.finished && b.finished.startsWith(year)).length;
+  // Conta a meta a partir do mês em que você começou a usar a leitura (primeiro livro cadastrado).
+  const firstM = S.books.map((b) => (b.started || b.finished || '').slice(0, 7)).filter(Boolean).sort()[0] || ym(new Date());
+  const fromM = firstM.startsWith(year) ? Number(firstM.slice(5, 7)) : 1;
+  const toM = year === String(new Date().getFullYear()) ? new Date().getMonth() + 1 : 12;
+  const monthsSoFar = Math.max(1, toM - fromM + 1);
+  const doneMonth = finishedIn(ui.month);
+  const finishedOther = S.books.filter((b) => b.finished && !b.finished.startsWith(ui.month)).sort((a, b) => b.finished.localeCompare(a.finished));
+  let tip = '';
+  if (r.st.status === 'current' && r.done < r.goal) {
+    if (r.main) tip = `<div class="ins ${r.perDay > 40 ? 'warn' : 'info'}"><div class="n">⏱️</div><div><div class="t">Leia ${r.perDay} páginas por dia</div>
+      <div class="x">Faltam ${r.left} páginas de "${esc(r.main.title)}" e ${r.st.daysLeft} dia${r.st.daysLeft > 1 ? 's' : ''} no mês.${r.perDay > 40 ? ' É bastante — reserve um horário fixo, como antes de dormir.' : ''}</div></div></div>`;
+    else tip = `<div class="ins info"><div class="n">📖</div><div><div class="t">Escolha o livro do mês</div><div class="x">Toque no + para cadastrar o livro que você vai ler.</div></div></div>`;
+  }
+  return `${monthBar()}
+  <h1>Leitura</h1>
+  <div class="card hero">
+    <div class="lbl">Meta: ${r.goal} livro${r.goal > 1 ? 's' : ''} por mês</div>
+    <div class="big num">${r.done} de ${r.goal}</div>
+    <div class="bar" style="background:rgba(255,255,255,.25)"><i style="width:${Math.min(1, r.done / r.goal) * 100}%;background:#fff"></i></div>
+    <div class="small" style="margin-top:10px;opacity:.9">Em ${year}: ${yearDone} livro${yearDone === 1 ? '' : 's'} concluído${yearDone === 1 ? '' : 's'} (meta até agora: ${monthsSoFar * r.goal})</div>
+  </div>
+  ${tip}
+  <h2>Lendo agora</h2>
+  <div class="card" style="padding:4px 12px">${r.reading.map(bookRow).join('') || '<div class="empty">Nenhum livro em andamento.</div>'}</div>
+  <button class="btn" data-act="newbook" style="margin-top:0">+ Cadastrar livro</button>
+  ${doneMonth.length ? `<h2>Concluídos em ${monthName(ui.month).split(' ')[0].toLowerCase()}</h2><div class="card" style="padding:4px 12px">${doneMonth.map(bookRow).join('')}</div>` : ''}
+  ${finishedOther.length ? `<h2>Outros concluídos</h2><div class="card" style="padding:4px 12px">${finishedOther.map(bookRow).join('')}</div>` : ''}
+  <h2>Meta mensal</h2>
+  <div class="card"><div class="chips">${[1, 2, 3, 4, 5].map((n) => `<button class="chip ${S.readGoal === n ? 'on' : ''}" data-readgoal="${n}">${n} livro${n > 1 ? 's' : ''}</button>`).join('')}</div></div>`;
+}
+
+function bookFormSheet(id) {
+  const b = id ? S.books.find((x) => x.id === id) : null;
+  openSheet(`<h1 style="margin-top:0">${b ? 'Editar livro' : 'Novo livro'}</h1>
+    <label class="f">Título</label><input class="in-f" id="bkTitle" maxlength="80" value="${esc(b ? b.title : '')}" placeholder="Ex.: O Poder do Hábito">
+    <label class="f">Autor (opcional)</label><input class="in-f" id="bkAuthor" maxlength="60" value="${esc(b ? b.author : '')}">
+    <div class="row" style="gap:10px"><div class="grow"><label class="f">Total de páginas</label><input class="in-f num" id="bkPages" inputmode="numeric" value="${b ? b.pages : ''}" placeholder="300"></div>
+      <div class="grow"><label class="f">Estou na página</label><input class="in-f num" id="bkCur" inputmode="numeric" value="${b ? b.current || 0 : 0}"></div></div>
+    <button class="btn" id="bkSave">${b ? 'Salvar' : 'Cadastrar livro'}</button>`);
+  if (!b) $('#bkTitle').focus({ preventScroll: true });
+  $('#sheet').onclick = (e) => {
+    if (!e.target.closest('#bkSave')) return;
+    const title = $('#bkTitle').value.trim();
+    const pages = parseInt($('#bkPages').value, 10);
+    const cur = Math.max(0, parseInt($('#bkCur').value, 10) || 0);
+    if (!title) { toast('Informe o título'); return; }
+    if (!(pages > 0)) { toast('Informe o total de páginas'); return; }
+    if (cur > pages) { toast('A página atual passa do total do livro'); return; }
+    if (b) Object.assign(b, { title, author: $('#bkAuthor').value.trim(), pages, current: cur });
+    else S.books.push({ id: uid(), title, author: $('#bkAuthor').value.trim(), pages, current: cur, started: today(), finished: null, notes: [] });
+    const book = b || S.books[S.books.length - 1];
+    if (cur === pages && !book.finished) book.finished = today();
+    save(); render(); bookSheet(book.id);
+  };
+}
+
+function bookSheet(id) {
+  const b = S.books.find((x) => x.id === id);
+  if (!b) { closeSheet(); return; }
+  const notes = [...(b.notes || [])].sort((x, y) => (y.date + y.id).localeCompare(x.date + x.id));
+  openSheet(`<div class="row"><div class="grow"><h1 style="margin:0">${esc(b.title)}</h1>${b.author ? `<div class="muted small">${esc(b.author)}</div>` : ''}</div>
+      <span class="tag ${b.finished ? 'good' : 'info'}">${b.finished ? 'concluído' : Math.round(bookPct(b) * 100) + '%'}</span></div>
+    <div class="bar" style="margin:12px 0 4px"><i style="width:${bookPct(b) * 100}%;background:${b.finished ? 'var(--good)' : 'var(--info)'}"></i></div>
+    <div class="small muted">Página ${b.current || 0} de ${b.pages} · faltam ${Math.max(0, b.pages - (b.current || 0))}</div>
+    <label class="f">Em que página você está?</label>
+    <div class="row"><input class="in-f num" id="bsCur" inputmode="numeric" value="${b.current || 0}" style="width:100px;text-align:center">
+      <div class="chips">${[10, 20, 50].map((n) => `<button class="chip" data-plus="${n}">+${n}</button>`).join('')}</div></div>
+    <button class="btn ghost" id="bsUpd" style="margin-top:10px">Atualizar página</button>
+    <button class="btn ${b.finished ? 'ghost' : ''}" id="bsDone" style="margin-top:10px">${b.finished ? '↩︎ Marcar como não concluído' : '✅ Concluí este livro'}</button>
+    <h2>Anotações</h2>
+    <textarea class="in-f" id="bsNote" rows="3" maxlength="2000" placeholder="O que você aprendeu, frases marcantes, ideias…" style="resize:vertical"></textarea>
+    <div class="row" style="margin-top:8px"><span class="small muted">Página</span><input class="in-f num" id="bsNotePg" inputmode="numeric" value="${b.current || ''}" style="width:80px;text-align:center">
+      <button class="btn" id="bsAddNote" style="margin:0;flex:1;padding:11px">Salvar anotação</button></div>
+    <div style="margin-top:8px">${notes.map((n) => `<div class="card" style="background:var(--bg);margin:8px 0;padding:12px">
+      <div class="row between small muted"><span>${new Date(n.date + 'T12:00').toLocaleDateString('pt-BR')}${n.page ? ` · pág. ${n.page}` : ''}</span>
+      <button class="x" data-delnote="${n.id}" aria-label="Apagar anotação" style="width:26px;height:26px">×</button></div>
+      <div style="white-space:pre-wrap;margin-top:4px">${esc(n.text)}</div></div>`).join('') || '<div class="small muted">Nenhuma anotação ainda.</div>'}</div>
+    <div class="row" style="gap:10px;margin-top:14px"><button class="btn ghost" id="bsEdit" style="margin:0">Editar livro</button>
+      <button class="btn danger" id="bsDel" style="margin:0">Excluir</button></div>`);
+  $('#sheet').onclick = (e) => {
+    const t = e.target.closest('button'); if (!t) return;
+    const setCur = (v) => {
+      b.current = Math.max(0, Math.min(b.pages, v));
+      if (b.current === b.pages && !b.finished) { b.finished = today(); toast(`🎉 "${b.title}" concluído!`); }
+      else toast(`Página ${b.current} de ${b.pages}`);
+      save(); render(); bookSheet(b.id);
+    };
+    if (t.dataset.plus) { $('#bsCur').value = Math.min(b.pages, (parseInt($('#bsCur').value, 10) || 0) + Number(t.dataset.plus)); }
+    else if (t.id === 'bsUpd') setCur(parseInt($('#bsCur').value, 10) || 0);
+    else if (t.id === 'bsDone') {
+      if (b.finished) b.finished = null;
+      else { b.finished = today(); b.current = b.pages; toast(`🎉 "${b.title}" concluído!`); }
+      save(); render(); bookSheet(b.id);
+    } else if (t.id === 'bsAddNote') {
+      const text = $('#bsNote').value.trim();
+      if (!text) { toast('Escreva a anotação'); return; }
+      const page = parseInt($('#bsNotePg').value, 10);
+      (b.notes = b.notes || []).push({ id: uid(), date: today(), page: page > 0 ? page : null, text });
+      save(); render(); bookSheet(b.id); toast('Anotação salva');
+    } else if (t.dataset.delnote) {
+      if (!confirm('Apagar esta anotação?')) return;
+      b.notes = b.notes.filter((n) => n.id !== t.dataset.delnote); save(); bookSheet(b.id);
+    } else if (t.id === 'bsEdit') bookFormSheet(b.id);
+    else if (t.id === 'bsDel') {
+      if (!confirm(`Excluir "${b.title}" e todas as anotações dele?`)) return;
+      S.books = S.books.filter((x) => x !== b); save(); closeSheet(); render(); toast('Livro excluído');
+    }
+  };
 }
 
 function viewBudget() {
@@ -735,6 +891,8 @@ function importData() {
       if (!confirm('Substituir os dados atuais pelo backup?')) return;
       if (!Array.isArray(d.pots)) d.pots = defaultPots(d.goalPct || 20);
       if (!Array.isArray(d.incomes)) d.incomes = d.income > 0 ? [{ id: uid(), name: 'Salário', kind: 'fixo', amount: d.income }] : [];
+      if (!Array.isArray(d.books)) d.books = S.books || [];
+      if (!(d.readGoal > 0)) d.readGoal = 1;
       S = d; save(); render(); toast('Backup restaurado');
     } catch (e) { toast('Arquivo de backup inválido'); }
   };
@@ -770,7 +928,10 @@ document.addEventListener('click', (e) => {
     }
     return;
   }
+  if (b.dataset.book) { bookSheet(b.dataset.book); return; }
+  if (b.dataset.readgoal) { S.readGoal = Number(b.dataset.readgoal); save(); render(); return; }
   switch (b.dataset.act) {
+    case 'newbook': bookFormSheet(null); break;
     case 'newpot': newPotSheet(); break;
     case 'newinc': newIncomeSheet(b.dataset.kind); break;
     case 'prev': ui.month = shiftMonth(ui.month, -1); render(); break;
