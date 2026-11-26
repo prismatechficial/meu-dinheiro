@@ -480,7 +480,7 @@ function viewBudget() {
   <h2>Seus dados</h2>
   <div class="card small muted">Tudo fica salvo só neste celular. Faça um backup de vez em quando.
     <button class="btn ghost" data-act="export">Baixar backup</button>
-    <button class="btn ghost" data-act="import" style="margin-top:10px">Restaurar backup</button>
+    <button class="btn ghost" data-act="import" style="margin-top:10px">Importar arquivo / restaurar backup</button>
     <button class="btn danger" data-act="reset" style="margin-top:10px">Apagar tudo e recomeçar</button>
   </div>`;
 }
@@ -503,7 +503,8 @@ function renderOnboarding() {
       ${goalCustomField('oGoalCustom', '')}
       <div class="small muted" id="oHint" style="margin-top:10px"></div>
       <button class="btn" data-act="start">Criar meu plano</button>
-    </div></div>`;
+    </div>
+    <button class="btn ghost" data-act="import" style="margin-top:4px">Importar arquivo / restaurar backup</button></div>`;
   let pct = 20;
   const vals = () => ({ sal: parseMoney($('#oSal').value), fix: parseMoney($('#oFix').value), vr: parseMoney($('#oVar').value) });
   const hint = () => {
@@ -553,14 +554,17 @@ function txSheet(id) {
   const t = id ? S.tx.find((x) => x.id === id) : null;
   let type = t ? t.type : 'out';
   let cat = t ? t.cat : null;
-  const srcOf = (s) => (S.incomes.find((i) => i.id === s || i.name === s) || { id: 'outros' }).id;
+  // Entradas importadas guardam o nome da origem (ex.: "Feiras") até existir um item com esse nome.
+  const srcOf = (s) => (S.incomes.find((i) => i.id === s || i.name === s) || { id: s || 'outros' }).id;
   let src = t ? srcOf(t.src) : (S.incomes[0] ? S.incomes[0].id : 'outros');
   const defDate = t ? t.date : (ui.month === ym(new Date()) ? today() : ui.month + '-01');
   const draw = () => {
     const chips = type === 'out'
       ? S.categories.map((c) => `<button class="chip ${cat === c.id ? 'on' : ''}" data-cat="${c.id}">${c.icon} ${esc(c.name)}</button>`).join('')
-      : [...S.incomes.map((i) => ({ id: i.id, l: `${i.kind === 'variavel' ? '🎯' : '💼'} ${i.name}` })), { id: 'outros', l: '➕ Outra entrada' }]
-        .map((s) => `<button class="chip ${src === s.id ? 'on' : ''}" data-src="${s.id}">${esc(s.l)}</button>`).join('');
+      : [...S.incomes.map((i) => ({ id: i.id, l: `${i.kind === 'variavel' ? '🎯' : '💼'} ${i.name}` })),
+        ...(src && src !== 'outros' && !S.incomes.some((i) => i.id === src) ? [{ id: src, l: `📥 ${src}` }] : []),
+        { id: 'outros', l: '➕ Outra entrada' }]
+        .map((s) => `<button class="chip ${src === s.id ? 'on' : ''}" data-src="${esc(s.id)}">${esc(s.l)}</button>`).join('');
     $('#txChips').innerHTML = chips;
     $('#txLbl').textContent = type === 'out' ? 'Categoria' : 'De onde veio';
     document.querySelectorAll('[data-type]').forEach((b) => b.classList.toggle('on', b.dataset.type === type));
@@ -704,6 +708,29 @@ function importData() {
   inp.onchange = async () => {
     try {
       const d = JSON.parse(await inp.files[0].text());
+      // Arquivo só com lançamentos: junta aos dados atuais, sem apagar nada.
+      if (d.kind === 'meu-dinheiro-lancamentos' && Array.isArray(d.tx)) {
+        const novos = d.tx.filter((t) => t && t.id && t.amount > 0 && /^\d{4}-\d{2}-\d{2}$/.test(t.date) && !S.tx.some((x) => x.id === t.id));
+        if (!novos.length) { toast('Esses lançamentos já estão no app'); return; }
+        const tot = novos.reduce((a, t) => a + (t.type === 'in' ? t.amount : 0), 0);
+        if (!confirm(`Adicionar ${novos.length} lançamentos${d.label ? ` (${d.label})` : ''}? Entradas somam ${money(tot)}. Nada do que já existe será apagado.`)) return;
+        const firstVar = S.incomes.find((i) => i.kind === 'variavel');
+        novos.forEach((t) => {
+          const name = String(t.src || '').slice(0, 40);
+          let src = null, desc = String(t.desc || '');
+          if (t.type === 'in') {
+            const it = S.incomes.find((i) => i.name.toLowerCase() === name.toLowerCase());
+            // Trabalho sem item próprio conta na meta do serviço variável; o nome vai na descrição.
+            if (it) src = it.id;
+            else if (firstVar) { src = firstVar.id; desc = desc ? `${name} — ${desc}` : name; }
+            else src = name || 'outros';
+          }
+          S.tx.push({ id: t.id, type: t.type === 'in' ? 'in' : 'out', amount: Math.round(t.amount * 100) / 100, date: t.date,
+            desc: desc.slice(0, 60), cat: t.type === 'in' ? null : t.cat || null, src });
+        });
+        save(); render(); toast(`${novos.length} lançamentos adicionados`);
+        return;
+      }
       if (!d.categories || !Array.isArray(d.tx)) throw new Error();
       if (!confirm('Substituir os dados atuais pelo backup?')) return;
       if (!Array.isArray(d.pots)) d.pots = defaultPots(d.goalPct || 20);
