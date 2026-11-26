@@ -1,5 +1,5 @@
 ﻿// Permite abrir o app sem internet depois do primeiro acesso.
-const CACHE = 'meu-dinheiro-v2';
+const CACHE = 'meu-dinheiro-v3';
 const FILES = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon.svg'];
 
 self.addEventListener('install', (e) => {

@@ -33,7 +33,6 @@ function parseGoal(s) {
   const v = parseFloat(String(s).replace(',', '.'));
   return isFinite(v) && v >= 1 && v <= 90 ? Math.round(v * 10) / 10 : null;
 }
-const INCOME_SOURCES =['Salário', 'Clientes / vendas', 'Extra', 'Outros'];
 const ICONS = ['🏠', '🛒', '🚗', '💡', '💊', '📚', '🎉', '🍔', '🛍️', '📺', '📦', '🐶', '👶', '💳', '✈️', '💼', '🎁', '⛽', '💇', '📱'];
 
 // ---------- estado ----------
@@ -45,10 +44,26 @@ function load() {
     const s = JSON.parse(localStorage.getItem(KEY));
     if (s && s.categories) {
       if (!Array.isArray(s.pots)) s.pots = defaultPots(s.goalPct || 20); // dados da versão anterior
+      if (!Array.isArray(s.incomes)) s.incomes = s.income > 0 ? [{ id: uid(), name: 'Salário', kind: 'fixo', amount: s.income }] : [];
       return s;
     }
   } catch (e) { /* começa do zero */ }
-  return { setupDone: false, income: 0, goalPct: 20, categories: [], pots: defaultPots(20), tx: [] };
+  return { setupDone: false, income: 0, goalPct: 20, categories: [], pots: defaultPots(20), incomes: [], tx: [] };
+}
+
+// ---------- entradas: salário, valores fixos e serviços variáveis ----------
+// kind 'fixo' = valor certo todo mês (salário, aluguel recebido, pró-labore)
+// kind 'variavel' = serviços/vendas que variam; amount é a META de lucro do mês
+const fixedIncome = () => S.incomes.filter((i) => i.kind === 'fixo').reduce((a, i) => a + i.amount, 0);
+const variableGoal = () => S.incomes.filter((i) => i.kind === 'variavel').reduce((a, i) => a + i.amount, 0);
+// S.income guarda a renda prevista do mês (fixos + metas variáveis), usada em todos os cálculos.
+function syncIncome() { S.income = Math.round((fixedIncome() + variableGoal()) * 100) / 100; }
+function incomeName(src) {
+  const i = S.incomes.find((x) => x.id === src);
+  return i ? i.name : (src && src !== 'outros' ? src : 'Outras entradas');
+}
+function receivedFor(item, txs) {
+  return txs.filter((t) => t.type === 'in' && (t.src === item.id || t.src === item.name)).reduce((a, t) => a + t.amount, 0);
 }
 function save() { localStorage.setItem(KEY, JSON.stringify(S)); }
 
@@ -119,8 +134,16 @@ function stats(m) {
   const txs = S.tx.filter((t) => t.date.startsWith(m));
   const income = txs.filter((t) => t.type === 'in').reduce((a, t) => a + t.amount, 0);
   const spent = txs.filter((t) => t.type === 'out').reduce((a, t) => a + t.amount, 0);
-  // Durante o mês usa a renda prevista enquanto o dinheiro não entrou todo.
-  const incomeBase = status === 'past' ? income : Math.max(income, S.income);
+  const incs = S.incomes.map((i) => {
+    const got = receivedFor(i, txs);
+    let proj = i.amount;
+    if (status === 'past') proj = got;
+    else if (status === 'current') proj = i.kind === 'fixo' ? Math.max(got, i.amount) : (elapsed >= 5 ? Math.max(got, (got / elapsed) * dim) : Math.max(got, i.amount));
+    return { ...i, got, proj, missing: Math.max(0, i.amount - got) };
+  });
+  const otherIn = income - incs.reduce((a, i) => a + i.got, 0); // entradas fora da lista (extras)
+  // Durante o mês: fixos contam pelo valor previsto; serviços variáveis pelo ritmo real de faturamento.
+  const incomeBase = status === 'past' ? income : Math.max(income, incs.reduce((a, i) => a + i.proj, 0) + otherIn);
 
   const cats = S.categories.map((c) => {
     const s = txs.filter((t) => t.type === 'out' && t.cat === c.id).reduce((a, t) => a + t.amount, 0);
@@ -135,7 +158,7 @@ function stats(m) {
   const budgetTotal = S.categories.reduce((a, c) => a + c.budget, 0);
   const canStillSpend = incomeBase - goal() - spent;
   const perDay = daysLeft > 0 ? canStillSpend / daysLeft : 0;
-  return { m, dim, status, elapsed, daysLeft, txs, income, spent, incomeBase, cats, projSpent,
+  return { m, dim, status, elapsed, daysLeft, txs, income, spent, incomeBase, cats, projSpent, incs,
     projLeft: incomeBase - projSpent, left: income - spent, budgetTotal, canStillSpend, perDay };
 }
 
@@ -159,7 +182,28 @@ function insights(st) {
       x: `As categorias somam ${money(st.budgetTotal)}, mas para sobrar ${money(g)} você só pode gastar ${money(spendable())}. Corte ${money(st.budgetTotal - spendable())} na aba Orçamento.` });
   }
   if (st.status === 'current' && st.income === 0) {
-    out.push({ lv: 'info', i: '💰', t: 'Registre o que entrou', x: `Ainda não há entradas neste mês. Estou usando sua renda prevista de ${money(S.income)} nos cálculos.` });
+    out.push({ lv: 'info', i: '💰', t: 'Registre o que entrou', x: `Ainda não há entradas neste mês. Estou usando sua renda prevista de ${money(S.income)} (fixos + metas dos serviços) nos cálculos.` });
+  }
+
+  // Metas de lucro dos serviços variáveis
+  st.incs.filter((i) => i.kind === 'variavel' && i.amount > 0).forEach((i) => {
+    if (i.got >= i.amount) {
+      out.push({ lv: 'good', i: '🎯', t: `Meta de ${i.name} batida: ${money(i.got)}`, x: `A meta era ${money(i.amount)}. O que passar disso é dinheiro extra — considere mandar parte para seus investimentos.` });
+    } else if (st.status === 'past') {
+      out.push({ lv: 'warn', i: '🎯', t: `${i.name}: faturou ${money(i.got)} de ${money(i.amount)}`, x: `Faltaram ${money(i.missing)}. Se for comum, ajuste a meta ou o orçamento do próximo mês.` });
+    } else if (st.status === 'current' && st.elapsed >= 5 && i.proj < i.amount * 0.9) {
+      const perWeek = (i.missing / st.daysLeft) * 7;
+      out.push({ lv: 'warn', i: '🎯', t: `${i.name}: no ritmo atual você fatura ${money(i.proj)} de ${money(i.amount)}`,
+        x: `Para bater a meta, precisa de mais ${money(i.missing)} — cerca de ${money(perWeek)} por semana. Nesse ritmo entram ${money(i.amount - i.proj)} a menos que o planejado — a previsão de sobra e o limite por dia já consideram isso.` });
+    }
+  });
+  const fx = fixedIncome(), vg = variableGoal();
+  if (vg > 0 && st.status === 'current' && fx < st.budgetTotal) {
+    const varGot = st.incs.filter((i) => i.kind === 'variavel').reduce((a, i) => a + i.got, 0);
+    if (varGot < st.budgetTotal - fx) {
+      out.push({ lv: 'info', i: '🧱', t: `Sua renda fixa (${money(fx)}) não cobre todos os gastos`,
+        x: `Você depende de faturar pelo menos ${money(st.budgetTotal - fx)} nos serviços para pagar o orçamento (já entrou ${money(varGot)}). Priorize as contas fixas até esse dinheiro entrar.` });
+    }
   }
 
   // Projeção do fechamento
@@ -280,6 +324,16 @@ function viewHome() {
       <div class="small muted">${v > 0 ? `nos próximos ${st.daysLeft} dias para sobrar ${money(g)}` : `Você já gastou o que podia. Evite novos gastos para não comer a meta de ${money(g)}.`}</div>
       </div></div>`;
   }
+  const incRows = st.incs.filter((i) => i.amount > 0 || i.got > 0).map((i) => {
+    const pct = i.amount ? i.got / i.amount : 1;
+    const done = i.got >= i.amount;
+    const tag = done ? `<span class="tag good">${i.kind === 'variavel' ? 'meta batida' : 'recebido'}</span>`
+      : `<span class="tag ${i.kind === 'variavel' ? 'info' : 'warn'}">falta ${moneyShort(i.missing)}</span>`;
+    return `<div class="cat"><div class="row"><div class="em">${i.kind === 'variavel' ? '🎯' : '💼'}</div><div class="grow">
+      <div class="row between"><b class="grow" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(i.name)}</b>${tag}</div>
+      <div class="small muted num">${money(i.got)} de ${money(i.amount)} · ${i.kind === 'variavel' ? 'meta de lucro' : 'fixo'}</div>
+      <div class="bar"><i style="width:${Math.min(100, pct * 100)}%;background:${i.kind === 'variavel' ? 'var(--info)' : 'var(--good)'}"></i></div></div></div></div>`;
+  }).join('');
   const ins = insights(st).slice(0, 3).map(insCard).join('');
   const cats = st.cats.filter((c) => c.budget > 0 || c.spent > 0).sort((a, b) => b.pct - a.pct).map((c) => catRow(c, st)).join('');
   const goalPct = g > 0 ? Math.max(0, Math.min(1, (st.status === 'current' ? st.projLeft : res) / g)) : 0;
@@ -297,6 +351,7 @@ function viewHome() {
   ${daily}
   <h2>O que fazer agora</h2>${ins}
   ${insights(st).length > 3 ? `<button class="btn ghost" data-tab="plan" style="margin-top:0">Ver plano completo</button>` : ''}
+  ${incRows ? `<h2>Entradas e metas de lucro</h2><div class="card">${incRows}</div>` : ''}
   <h2>Limites por categoria</h2><div class="card">${cats || '<div class="empty">Sem categorias</div>'}</div>`;
 }
 
@@ -314,7 +369,7 @@ function viewTx() {
     if (t.date !== lastDay) { if (lastDay) html += '</div>'; html += `<div class="day">${dayLabel(t.date)}</div><div class="card" style="padding:4px 12px">`; lastDay = t.date; }
     const c = S.categories.find((x) => x.id === t.cat);
     const icon = t.type === 'in' ? '💰' : (c ? c.icon : '📦');
-    const name = t.type === 'in' ? (t.src || 'Entrada') : (c ? c.name : 'Sem categoria');
+    const name = t.type === 'in' ? incomeName(t.src) : (c ? c.name : 'Sem categoria');
     html += `<button class="tx" data-edit="${t.id}"><div class="em" style="width:36px;height:36px;border-radius:11px;display:grid;place-items:center;background:var(--bg)">${icon}</div>
       <div class="grow"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.desc || name)}</div><div class="small muted">${esc(name)}</div></div>
       <div class="v num ${t.type}">${t.type === 'in' ? '+' : '−'} ${money(t.amount)}</div></button>`;
@@ -342,6 +397,11 @@ function viewPlan() {
 
   const steps = [
     { t: `Separe ${money(g)} assim que o dinheiro entrar`, x: (S.pots.length ? S.pots.map((p) => `${p.icon} ${p.name}: ${money(potValue(p))}`).join(' · ') + '. ' : '') + 'Faça as transferências no dia em que receber. O que sobra é o que você pode gastar — não o contrário.' },
+    ...(variableGoal() > 0 ? [{
+      t: `Bata a meta de lucro: ${money(variableGoal())} em serviços`,
+      x: `Isso dá ${money((variableGoal() / st.dim) * 7)} por semana. ` + S.incomes.filter((i) => i.kind === 'variavel').map((i) => `🎯 ${i.name}: ${money(i.amount)}`).join(' · ') +
+        `. Sua renda fixa é ${money(fixedIncome())}${fixedIncome() < fixedTotal + g ? ' — ela não cobre contas fixas + meta de sobra, então o mês depende dos serviços' : ''}.`,
+    }] : []),
     { t: `Pague os gastos fixos: ${money(fixedTotal)}`, x: fixed.map((c) => `${c.icon} ${c.name}: ${money(c.budget)}`).join(' · ') || 'Nenhum gasto fixo cadastrado.' },
     { t: `Gasto do dia a dia: até ${money(varTotal / st.dim)} por dia`, x: `Isso dá ${money((varTotal / st.dim) * 7)} por semana para ${variable.map((c) => c.name.toLowerCase()).slice(0, 4).join(', ')}${variable.length > 4 ? ' e outros' : ''}.` },
     { t: 'Registre cada gasto no mesmo dia', x: 'Leva 5 segundos no botão +. Sem registro, o app não consegue te avisar a tempo.' },
@@ -379,11 +439,26 @@ function viewBudget() {
     pctOfIncome(c.budget), c.budget, `data-budpct="${c.id}"`, `data-bud="${c.id}"`, `data-delcat="${c.id}"`)).join('');
   const pots = S.pots.map((p) => pairRow(p.icon, p.name, 'Guardar todo mês', p.pct, potValue(p),
     `data-potpct="${p.id}"`, `data-potval="${p.id}"`, `data-delpot="${p.id}"`)).join('');
+  const incRow = (i) => `<div class="bud"><span style="font-size:20px">${i.kind === 'variavel' ? '🎯' : '💼'}</span>
+    <div class="grow"><div style="font-weight:600;font-size:15px">${esc(i.name)}</div><div class="small muted">${i.kind === 'variavel' ? 'meta de lucro do mês' : 'valor fixo por mês'}</div></div>
+    <input class="in-f num" inputmode="decimal" data-incval="${i.id}" value="${fmtInput(i.amount)}">
+    <button class="x" data-delinc="${i.id}" aria-label="Remover">×</button></div>`;
+  const fixos = S.incomes.filter((i) => i.kind === 'fixo').map(incRow).join('');
+  const vars = S.incomes.filter((i) => i.kind === 'variavel').map(incRow).join('');
   return `<h1>Orçamento mensal</h1>
+  <h2 style="margin-top:6px">Suas entradas do mês</h2>
   <div class="card">
-    <label class="f" style="margin-top:0">Quanto você ganha por mês (renda prevista)</label>
-    <input class="in-f num" id="inc" inputmode="decimal" value="${fmtInput(S.income)}">
-    <label class="f">Quanto quer sobrar por mês</label>
+    <div class="small muted" style="font-weight:600">💼 Salário e valores fixos</div>
+    ${fixos || '<div class="small muted" style="padding:8px 0">Nenhum valor fixo.</div>'}
+    <button class="btn ghost" data-act="newinc" data-kind="fixo" style="margin-top:8px">+ Salário ou valor fixo</button>
+    <div class="small muted" style="font-weight:600;margin-top:18px">🎯 Serviços e vendas variáveis (meta de lucro)</div>
+    ${vars || '<div class="small muted" style="padding:8px 0">Nenhum serviço variável.</div>'}
+    <button class="btn ghost" data-act="newinc" data-kind="variavel" style="margin-top:8px">+ Serviço variável</button>
+    <div class="row between" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--line)">
+      <span class="small muted">Fixo ${money(fixedIncome())} + metas ${money(variableGoal())}</span><b class="num">${money(S.income)}</b></div>
+  </div>
+  <div class="card">
+    <label class="f" style="margin-top:0">Quanto quer sobrar por mês</label>
     <div class="chips" id="goalChips">${GOAL_OPTS.map((p) => `<button class="chip ${S.goalPct === p ? 'on' : ''}" data-goal="${p}">${p}%</button>`).join('')}</div>
     ${goalCustomField('goalCustom', GOAL_OPTS.includes(S.goalPct) ? '' : fmtPct(S.goalPct))}
     <div class="small muted" style="margin-top:10px">Meta: <b>${money(goal())}</b> por mês · Para gastar: <b>${money(spendable())}</b></div>
@@ -413,11 +488,16 @@ function viewBudget() {
 function renderOnboarding() {
   $('#app').innerHTML = `<div class="onb">
     <div class="logo">💚</div><h1 style="font-size:28px;margin-bottom:6px">Meu Dinheiro</h1>
-    <p class="muted" style="margin-top:0">Vamos montar seu plano. Diga quanto você ganha e quanto quer sobrar — o app calcula quanto pode gastar em cada área.</p>
+    <p class="muted" style="margin-top:0">Vamos montar seu plano. Diga o que entra no mês e quanto quer sobrar — o app calcula quanto pode gastar em cada área.</p>
     <div class="card">
-      <label class="f" style="margin-top:0">Quanto você ganha por mês?</label>
-      <input class="in-f money num" id="oInc" inputmode="decimal" placeholder="R$ 0,00">
-      <div class="small muted" style="margin-top:6px">Some salário, clientes e outras rendas. Pode ser uma média.</div>
+      <label class="f" style="margin-top:0">💼 Salário</label>
+      <input class="in-f num" id="oSal" inputmode="decimal" placeholder="R$ 0,00">
+      <label class="f">💼 Outros valores fixos por mês (opcional)</label>
+      <input class="in-f num" id="oFix" inputmode="decimal" placeholder="Pró-labore, aluguel recebido, pensão…">
+      <label class="f">🎯 Meta de lucro com serviços / vendas (opcional)</label>
+      <input class="in-f num" id="oVar" inputmode="decimal" placeholder="Quanto quer faturar no mês">
+      <div class="small muted" style="margin-top:6px">Depois você pode separar por serviço e adicionar mais itens na aba Orçamento.</div>
+      <div class="row between" style="margin-top:12px"><span class="small muted">Total previsto no mês</span><b class="num" id="oTot">R$ 0,00</b></div>
       <label class="f">Quanto quer sobrar todo mês?</label>
       <div class="chips" id="oGoal">${GOAL_OPTS.map((p) => `<button class="chip ${p === 20 ? 'on' : ''}" data-ogoal="${p}">${p}%</button>`).join('')}</div>
       ${goalCustomField('oGoalCustom', '')}
@@ -425,11 +505,13 @@ function renderOnboarding() {
       <button class="btn" data-act="start">Criar meu plano</button>
     </div></div>`;
   let pct = 20;
+  const vals = () => ({ sal: parseMoney($('#oSal').value), fix: parseMoney($('#oFix').value), vr: parseMoney($('#oVar').value) });
   const hint = () => {
-    const v = parseMoney($('#oInc').value);
+    const { sal, fix, vr } = vals(); const v = sal + fix + vr;
+    $('#oTot').textContent = money(v);
     $('#oHint').innerHTML = v > 0 ? `Você vai guardar <b>${money(v * pct / 100)}</b> e terá <b>${money(v - v * pct / 100)}</b> para gastar no mês.` : '';
   };
-  $('#oInc').addEventListener('input', hint);
+  ['#oSal', '#oFix', '#oVar'].forEach((s) => $(s).addEventListener('input', hint));
   $('#oGoal').addEventListener('click', (e) => {
     const b = e.target.closest('[data-ogoal]'); if (!b) return;
     pct = Number(b.dataset.ogoal);
@@ -445,9 +527,13 @@ function renderOnboarding() {
     hint();
   });
   $('[data-act="start"]').addEventListener('click', () => {
-    const v = parseMoney($('#oInc').value);
-    if (!(v > 0)) { toast('Informe quanto você ganha por mês'); $('#oInc').focus(); return; }
-    S.income = v; S.goalPct = pct; S.pots = defaultPots(pct); S.setupDone = true;
+    const { sal, fix, vr } = vals();
+    if (!(sal + fix + vr > 0)) { toast('Informe seu salário, valores fixos ou meta de serviços'); $('#oSal').focus(); return; }
+    S.incomes = [];
+    if (sal > 0) S.incomes.push({ id: uid(), name: 'Salário', kind: 'fixo', amount: sal });
+    if (fix > 0) S.incomes.push({ id: uid(), name: 'Outros valores fixos', kind: 'fixo', amount: fix });
+    if (vr > 0) S.incomes.push({ id: uid(), name: 'Serviços / vendas', kind: 'variavel', amount: vr });
+    syncIncome(); S.goalPct = pct; S.pots = defaultPots(pct); S.setupDone = true;
     S.categories = DEFAULT_CATS.map((c) => ({ id: uid(), ...c, budget: 0 }));
     distribute(); save(); render();
     toast('Plano criado! Toque no + para registrar gastos');
@@ -467,12 +553,14 @@ function txSheet(id) {
   const t = id ? S.tx.find((x) => x.id === id) : null;
   let type = t ? t.type : 'out';
   let cat = t ? t.cat : null;
-  let src = t ? t.src : INCOME_SOURCES[0];
+  const srcOf = (s) => (S.incomes.find((i) => i.id === s || i.name === s) || { id: 'outros' }).id;
+  let src = t ? srcOf(t.src) : (S.incomes[0] ? S.incomes[0].id : 'outros');
   const defDate = t ? t.date : (ui.month === ym(new Date()) ? today() : ui.month + '-01');
   const draw = () => {
     const chips = type === 'out'
       ? S.categories.map((c) => `<button class="chip ${cat === c.id ? 'on' : ''}" data-cat="${c.id}">${c.icon} ${esc(c.name)}</button>`).join('')
-      : INCOME_SOURCES.map((s) => `<button class="chip ${src === s ? 'on' : ''}" data-src="${esc(s)}">${esc(s)}</button>`).join('');
+      : [...S.incomes.map((i) => ({ id: i.id, l: `${i.kind === 'variavel' ? '🎯' : '💼'} ${i.name}` })), { id: 'outros', l: '➕ Outra entrada' }]
+        .map((s) => `<button class="chip ${src === s.id ? 'on' : ''}" data-src="${s.id}">${esc(s.l)}</button>`).join('');
     $('#txChips').innerHTML = chips;
     $('#txLbl').textContent = type === 'out' ? 'Categoria' : 'De onde veio';
     document.querySelectorAll('[data-type]').forEach((b) => b.classList.toggle('on', b.dataset.type === type));
@@ -502,11 +590,32 @@ function txSheet(id) {
       if (type === 'out') {
         const st = stats(ui.month); const c = st.cats.find((x) => x.id === cat);
         toast(c && c.spent > c.budget ? `⚠️ ${c.name} passou do limite` : c ? `Restam ${money(c.left)} em ${c.name}` : 'Salvo');
-      } else toast('Entrada registrada');
+      } else {
+        const it = stats(ui.month).incs.find((i) => i.id === src);
+        toast(it && it.kind === 'variavel' ? (it.got >= it.amount ? `🎯 Meta de ${it.name} batida!` : `${it.name}: ${money(it.got)} de ${money(it.amount)} — faltam ${money(it.missing)}`) : 'Entrada registrada');
+      }
     } else if (b.id === 'txDel') {
       if (!confirm('Excluir este lançamento?')) return;
       S.tx = S.tx.filter((x) => x.id !== t.id); save(); closeSheet(); render(); toast('Lançamento excluído');
     }
+  };
+}
+
+function newIncomeSheet(kind) {
+  const v = kind === 'variavel';
+  openSheet(`<h1 style="margin-top:0">${v ? '🎯 Novo serviço variável' : '💼 Novo valor fixo'}</h1>
+    <p class="small muted" style="margin-top:0">${v ? 'Serviços, vendas ou clientes que variam no mês. Coloque quanto quer faturar — essa é sua meta de lucro.' : 'Algo que entra todo mês no mesmo valor: salário, pró-labore, aluguel recebido, pensão.'}</p>
+    <label class="f">Nome</label><input class="in-f" id="niName" maxlength="30" placeholder="${v ? 'Ex.: Sites, Consultoria, Vendas Shopee' : 'Ex.: Salário, Pró-labore, Aluguel do apto'}">
+    <label class="f">${v ? 'Meta de lucro no mês' : 'Valor por mês'}</label><input class="in-f money num" id="niAmt" inputmode="decimal" placeholder="R$ 0,00">
+    <button class="btn" id="niSave">Adicionar</button>`);
+  $('#sheet').onclick = (e) => {
+    if (!e.target.closest('#niSave')) return;
+    const name = $('#niName').value.trim(), amount = parseMoney($('#niAmt').value);
+    if (!name) { toast('Dê um nome'); return; }
+    if (!(amount > 0)) { toast('Informe o valor'); return; }
+    S.incomes.push({ id: uid(), name, kind, amount });
+    syncIncome(); save(); closeSheet(); render();
+    toast(`Renda prevista: ${money(S.income)}. Toque em "Redistribuir" para ajustar os limites.`);
   };
 }
 
@@ -597,6 +706,8 @@ function importData() {
       const d = JSON.parse(await inp.files[0].text());
       if (!d.categories || !Array.isArray(d.tx)) throw new Error();
       if (!confirm('Substituir os dados atuais pelo backup?')) return;
+      if (!Array.isArray(d.pots)) d.pots = defaultPots(d.goalPct || 20);
+      if (!Array.isArray(d.incomes)) d.incomes = d.income > 0 ? [{ id: uid(), name: 'Salário', kind: 'fixo', amount: d.income }] : [];
       S = d; save(); render(); toast('Backup restaurado');
     } catch (e) { toast('Arquivo de backup inválido'); }
   };
@@ -625,8 +736,16 @@ document.addEventListener('click', (e) => {
     }
     return;
   }
+  if (b.dataset.delinc) {
+    const i = S.incomes.find((x) => x.id === b.dataset.delinc);
+    if (confirm(`Remover "${i.name}" das entradas? Os valores já lançados continuam contando.`)) {
+      S.incomes = S.incomes.filter((x) => x !== i); syncIncome(); save(); render();
+    }
+    return;
+  }
   switch (b.dataset.act) {
     case 'newpot': newPotSheet(); break;
+    case 'newinc': newIncomeSheet(b.dataset.kind); break;
     case 'prev': ui.month = shiftMonth(ui.month, -1); render(); break;
     case 'next': ui.month = shiftMonth(ui.month, 1); render(); break;
     case 'add': txSheet(null); break;
@@ -645,8 +764,12 @@ document.addEventListener('change', (e) => {
     if (p === null) { toast('Digite um valor entre 1 e 90%'); return; }
     setGoalTotal(p); save(); render(); toast(`Meta: sobrar ${money(goal())} (${p}%). Toque em "Redistribuir" para ajustar os limites.`);
   }
-  if (e.target.id === 'inc') { S.income = parseMoney(e.target.value); save(); render(); toast('Renda atualizada. Toque em "Redistribuir" para ajustar os limites.'); }
   const d = e.target.dataset || {};
+  if (d.incval) {
+    const i = S.incomes.find((x) => x.id === d.incval);
+    i.amount = parseMoney(e.target.value); syncIncome(); save(); render();
+    toast(`Renda prevista: ${money(S.income)}. Toque em "Redistribuir" para ajustar os limites.`);
+  }
   if (d.bud) {
     const c = S.categories.find((x) => x.id === d.bud);
     c.budget = parseMoney(e.target.value); save(); render();
