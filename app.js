@@ -1,8 +1,8 @@
 /* Meu Dinheiro — controle de gastos, receitas e plano do mês.
-   Tudo fica salvo no próprio celular (localStorage). */
+   Tudo fica salvo no próprio celular (localStorage), criptografado por perfil com a senha de cada pessoa. */
 'use strict';
 
-const KEY = 'meu-dinheiro.v1';
+const LEGACY_KEY = 'meu-dinheiro.v1'; // versão sem senha: migrada para um perfil na primeira abertura
 const BRL = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
 const money = (v) => BRL.format(Math.round(v * 100) / 100);
 const moneyShort = (v) => money(v).replace(',00', '');
@@ -36,22 +36,85 @@ function parseGoal(s) {
 const ICONS = ['🏠', '🛒', '🚗', '💡', '💊', '📚', '🎉', '🍔', '🛍️', '📺', '📦', '🐶', '👶', '💳', '✈️', '💼', '🎁', '⛽', '💇', '📱'];
 
 // ---------- estado ----------
-let S = load();
 let ui = { tab: 'home', month: ym(new Date()), filter: 'all' };
+let session = null; // perfil aberto: { profile, key } — a chave só existe na memória
+let S = blank();
 
-function load() {
-  try {
-    const s = JSON.parse(localStorage.getItem(KEY));
-    if (s && s.categories) {
-      if (!Array.isArray(s.pots)) s.pots = defaultPots(s.goalPct || 20); // dados da versão anterior
-      if (!Array.isArray(s.incomes)) s.incomes = s.income > 0 ? [{ id: uid(), name: 'Salário', kind: 'fixo', amount: s.income }] : [];
-      if (!Array.isArray(s.books)) s.books = [];
-      if (!(s.readGoal > 0)) s.readGoal = 1;
-      return s;
-    }
-  } catch (e) { /* começa do zero */ }
+function blank() {
   return { setupDone: false, income: 0, goalPct: 20, categories: [], pots: defaultPots(20), incomes: [], tx: [], books: [], readGoal: 1 };
 }
+// Completa dados de versões anteriores do app.
+function normalize(s) {
+  if (!s || !s.categories) return blank();
+  if (!Array.isArray(s.pots)) s.pots = defaultPots(s.goalPct || 20);
+  if (!Array.isArray(s.incomes)) s.incomes = s.income > 0 ? [{ id: uid(), name: 'Salário', kind: 'fixo', amount: s.income }] : [];
+  if (!Array.isArray(s.books)) s.books = [];
+  if (!(s.readGoal > 0)) s.readGoal = 1;
+  if (!Array.isArray(s.tx)) s.tx = [];
+  return s;
+}
+
+// ---------- perfis com senha ----------
+// Cada perfil guarda os dados criptografados (AES-GCM 256). A chave vem da senha (PBKDF2-SHA256),
+// então sem a senha certa os dados não podem ser lidos — nem por quem mexer no celular.
+const PROFILES_KEY = 'meu-dinheiro.perfis';
+const dataKey = (id) => 'meu-dinheiro.dados.' + id;
+const PBKDF2_ITER = 250000;
+const getProfiles = () => { try { return JSON.parse(localStorage.getItem(PROFILES_KEY)) || []; } catch (e) { return []; } };
+const setProfiles = (p) => localStorage.setItem(PROFILES_KEY, JSON.stringify(p));
+function b64(buf) {
+  const a = new Uint8Array(buf); let s = '';
+  for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+async function deriveKey(pass, salt, iter) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function encryptStr(key, str) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(str));
+  return { iv: b64(iv), ct: b64(ct) };
+}
+async function decryptStr(key, rec) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(rec.iv) }, key, unb64(rec.ct));
+  return new TextDecoder().decode(pt);
+}
+async function createProfile(name, pass, data) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const profile = { id: uid(), name, salt: b64(salt), iter: PBKDF2_ITER, created: today() };
+  const key = await deriveKey(pass, salt, PBKDF2_ITER);
+  localStorage.setItem(dataKey(profile.id), JSON.stringify(await encryptStr(key, JSON.stringify(data))));
+  setProfiles([...getProfiles(), profile]);
+  return { profile, key };
+}
+// Devolve a sessão se a senha estiver certa; null se estiver errada.
+async function openProfile(profile, pass) {
+  const key = await deriveKey(pass, unb64(profile.salt), profile.iter);
+  try {
+    const raw = await decryptStr(key, JSON.parse(localStorage.getItem(dataKey(profile.id))));
+    return { session: { profile, key }, data: normalize(JSON.parse(raw)) };
+  } catch (e) { return null; }
+}
+let saving = Promise.resolve();
+function save() {
+  if (!session) return;
+  const snap = JSON.stringify(S), sess = session;
+  saving = saving.then(async () => localStorage.setItem(dataKey(sess.profile.id), JSON.stringify(await encryptStr(sess.key, snap))))
+    .catch(() => toast('Não foi possível salvar. Verifique o espaço do celular.'));
+}
+async function lockApp() {
+  await saving;
+  session = null; S = blank(); ui.tab = 'home'; lockUi = { mode: 'list', sel: null };
+  closeSheet(); render();
+}
+// Bloqueia sozinho se o app ficar mais de 5 minutos em segundo plano.
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) hiddenAt = Date.now();
+  else if (session && hiddenAt && Date.now() - hiddenAt > 5 * 60 * 1000) lockApp();
+});
 
 // ---------- entradas: salário, valores fixos e serviços variáveis ----------
 // kind 'fixo' = valor certo todo mês (salário, aluguel recebido, pró-labore)
@@ -67,7 +130,6 @@ function incomeName(src) {
 function receivedFor(item, txs) {
   return txs.filter((t) => t.type === 'in' && (t.src === item.id || t.src === item.name)).reduce((a, t) => a + t.amount, 0);
 }
-function save() { localStorage.setItem(KEY, JSON.stringify(S)); }
 
 // ---------- destinos do dinheiro guardado ----------
 const POT_ICONS = ['🛟', '📈', '🏦', '✈️', '🎓', '🏡', '🚗', '🎁', '👶', '💍'];
@@ -283,7 +345,127 @@ function insights(st) {
 }
 
 // ---------- telas ----------
+// ---------- tela de entrada: perfis e senha ----------
+let lockUi = { mode: 'list', sel: null };
+function renderLock() {
+  $('#tabs').innerHTML = '';
+  if (!window.crypto || !crypto.subtle) {
+    $('#app').innerHTML = `<div class="onb"><div class="logo">🔒</div><h1>Meu Dinheiro</h1>
+      <p class="muted">Abra o app pelo endereço seguro (https) para usar os perfis com senha.</p></div>`;
+    return;
+  }
+  const profiles = getProfiles();
+  const legacy = localStorage.getItem(LEGACY_KEY);
+  const creating = !profiles.length || lockUi.mode === 'new';
+  const header = `<div class="logo">🔒</div><h1 style="font-size:28px;margin-bottom:6px">Meu Dinheiro</h1>`;
+  if (creating) {
+    const first = !profiles.length;
+    $('#app').innerHTML = `<div class="onb">${header}
+      <p class="muted" style="margin-top:0">${first && legacy ? 'Agora o app tem perfis com senha. Crie o seu — seus dados atuais vão para ele e ficam protegidos.' : first ? 'Crie seu perfil. Cada pessoa que usar o app tem o próprio perfil e a própria senha.' : 'Novo perfil para outra pessoa. Os dados dela ficam separados dos seus e protegidos pela senha dela.'}</p>
+      <div class="card">
+        <label class="f" style="margin-top:0">Nome</label><input class="in-f" id="lkName" maxlength="24" placeholder="Ex.: Matheus">
+        <label class="f">Senha</label><input class="in-f" id="lkPass" type="password" autocomplete="new-password" placeholder="Mínimo 4 caracteres">
+        <label class="f">Repita a senha</label><input class="in-f" id="lkPass2" type="password" autocomplete="new-password">
+        <div class="small muted" style="margin-top:10px">⚠️ Guarde bem a senha: se esquecer, não há como recuperar os dados desse perfil.</div>
+        <button class="btn" id="lkCreate">${first && legacy ? 'Criar perfil e proteger meus dados' : 'Criar perfil'}</button>
+        ${first ? '' : '<button class="btn ghost" id="lkBack" style="margin-top:10px">Voltar</button>'}
+      </div></div>`;
+    $('#lkName').focus({ preventScroll: true });
+    $('#lkCreate').onclick = async () => {
+      const name = $('#lkName').value.trim(), p1 = $('#lkPass').value, p2 = $('#lkPass2').value;
+      if (!name) { toast('Informe o nome'); return; }
+      if (profiles.some((p) => p.name.toLowerCase() === name.toLowerCase())) { toast('Já existe um perfil com esse nome'); return; }
+      if (p1.length < 4) { toast('A senha precisa ter pelo menos 4 caracteres'); return; }
+      if (p1 !== p2) { toast('As senhas não são iguais'); return; }
+      busy('#lkCreate', 'Criando…');
+      let data = blank();
+      if (first && legacy) { try { data = normalize(JSON.parse(legacy)); } catch (e) { /* começa do zero */ } }
+      session = await createProfile(name, p1, data);
+      S = data;
+      if (first && legacy) localStorage.removeItem(LEGACY_KEY); // dados agora só existem criptografados
+      lockUi = { mode: 'list', sel: null }; ui.tab = 'home'; render();
+      toast(`Olá, ${name}! Perfil criado.`);
+    };
+    if ($('#lkBack')) $('#lkBack').onclick = () => { lockUi = { mode: 'list', sel: null }; render(); };
+    return;
+  }
+  const sel = profiles.find((p) => p.id === lockUi.sel) || (profiles.length === 1 ? profiles[0] : null);
+  $('#app').innerHTML = `<div class="onb">${header}
+    <p class="muted" style="margin-top:0">${sel ? 'Digite a senha para entrar.' : 'Quem está usando?'}</p>
+    <div class="card">
+      ${profiles.map((p) => `<button class="tx" data-prof="${p.id}" style="${sel && sel.id === p.id ? 'font-weight:700' : ''}">
+        <div style="width:40px;height:40px;border-radius:50%;background:var(--brand-soft);color:var(--brand);display:grid;place-items:center;font-weight:750;flex:none">${esc(p.name.charAt(0).toUpperCase())}</div>
+        <div class="grow">${esc(p.name)}</div><span class="muted">${sel && sel.id === p.id ? '🔓' : '›'}</span></button>`).join('')}
+      ${sel ? `<label class="f">Senha de ${esc(sel.name)}</label>
+        <input class="in-f" id="lkPass" type="password" autocomplete="current-password">
+        <button class="btn" id="lkEnter">Entrar</button>` : ''}
+    </div>
+    <button class="btn ghost" id="lkNew" style="margin-top:4px">+ Novo perfil</button></div>`;
+  document.querySelectorAll('[data-prof]').forEach((b) => { b.onclick = () => { lockUi.sel = b.dataset.prof; render(); }; });
+  $('#lkNew').onclick = () => { lockUi = { mode: 'new', sel: null }; render(); };
+  if (sel) {
+    const enter = async () => {
+      const pass = $('#lkPass').value;
+      if (!pass) { toast('Digite a senha'); return; }
+      busy('#lkEnter', 'Abrindo…');
+      const r = await openProfile(sel, pass);
+      if (!r) {
+        lockUi.fails = (lockUi.fails || 0) + 1;
+        await new Promise((res) => setTimeout(res, Math.min(8000, 500 * 2 ** lockUi.fails))); // atrasa tentativas seguidas
+        render(); toast('Senha incorreta'); return;
+      }
+      session = r.session; S = r.data; lockUi = { mode: 'list', sel: null }; ui.tab = 'home'; render();
+    };
+    $('#lkEnter').onclick = enter;
+    $('#lkPass').onkeydown = (e) => { if (e.key === 'Enter') enter(); };
+    $('#lkPass').focus({ preventScroll: true });
+  }
+}
+function changePassSheet() {
+  openSheet(`<h1 style="margin-top:0">Mudar senha</h1>
+    <label class="f">Senha atual</label><input class="in-f" id="cpOld" type="password" autocomplete="current-password">
+    <label class="f">Nova senha</label><input class="in-f" id="cpNew" type="password" autocomplete="new-password" placeholder="Mínimo 4 caracteres">
+    <label class="f">Repita a nova senha</label><input class="in-f" id="cpNew2" type="password" autocomplete="new-password">
+    <button class="btn" id="cpSave">Salvar nova senha</button>`);
+  $('#sheet').onclick = async (e) => {
+    if (!e.target.closest('#cpSave')) return;
+    const n1 = $('#cpNew').value;
+    if (n1.length < 4) { toast('A nova senha precisa ter pelo menos 4 caracteres'); return; }
+    if (n1 !== $('#cpNew2').value) { toast('As senhas novas não são iguais'); return; }
+    busy('#cpSave', 'Salvando…');
+    await saving;
+    const p = session.profile;
+    if (!(await openProfile(p, $('#cpOld').value))) { toast('Senha atual incorreta'); changePassSheet(); return; }
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const key = await deriveKey(n1, salt, PBKDF2_ITER);
+    localStorage.setItem(dataKey(p.id), JSON.stringify(await encryptStr(key, JSON.stringify(S))));
+    const np = { ...p, salt: b64(salt), iter: PBKDF2_ITER };
+    setProfiles(getProfiles().map((x) => (x.id === p.id ? np : x)));
+    session = { profile: np, key };
+    closeSheet(); toast('Senha alterada');
+  };
+}
+function deleteProfileSheet() {
+  const p = session.profile;
+  openSheet(`<h1 style="margin-top:0">Excluir perfil ${esc(p.name)}</h1>
+    <p class="small muted">Todos os gastos, entradas, metas e livros deste perfil serão apagados deste celular. Isso não pode ser desfeito. Os outros perfis continuam como estão.</p>
+    <label class="f">Digite sua senha para confirmar</label><input class="in-f" id="dpPass" type="password" autocomplete="current-password">
+    <button class="btn danger" id="dpGo">Excluir meu perfil</button>`);
+  $('#sheet').onclick = async (e) => {
+    if (!e.target.closest('#dpGo')) return;
+    busy('#dpGo', 'Verificando…');
+    await saving;
+    if (!(await openProfile(p, $('#dpPass').value))) { toast('Senha incorreta'); deleteProfileSheet(); return; }
+    localStorage.removeItem(dataKey(p.id));
+    setProfiles(getProfiles().filter((x) => x.id !== p.id));
+    session = null; S = blank(); lockUi = { mode: 'list', sel: null }; closeSheet(); render();
+    toast('Perfil excluído');
+  };
+}
+function busy(sel, label) { const b = $(sel); if (b) { b.disabled = true; b.textContent = label; b.style.opacity = '.6'; } }
+
 function render() {
+  if (!session) { renderLock(); return; }
   if (!S.setupDone) { renderOnboarding(); $('#tabs').innerHTML = ''; return; }
   renderTabs();
   const v = { home: viewHome, tx: viewTx, plan: viewPlan, budget: viewBudget, read: viewRead, avg: viewAvg }[ui.tab];
@@ -292,7 +474,10 @@ function render() {
 }
 
 function monthBar() {
-  return `<div class="monthbar"><button data-act="prev" aria-label="Mês anterior">‹</button>
+  const me = session ? session.profile.name : '';
+  return `<div class="row between" style="margin:0 0 6px"><span class="small muted">👤 ${esc(me)}</span>
+    <button class="chip" data-act="lock" style="padding:5px 10px;font-size:13px">🔒 Bloquear / trocar perfil</button></div>
+  <div class="monthbar"><button data-act="prev" aria-label="Mês anterior">‹</button>
     <strong>${monthName(ui.month)}</strong><button data-act="next" aria-label="Próximo mês">›</button></div>`;
 }
 
@@ -732,11 +917,19 @@ function viewBudget() {
     <button class="btn ghost" data-act="auto">Redistribuir automaticamente</button>
     <button class="btn ghost" data-act="newcat" style="margin-top:10px">+ Nova categoria</button>
   </div>
+  <h2>Perfil e senha</h2>
+  <div class="card small muted">Perfil: <b style="color:var(--ink)">${esc(session.profile.name)}</b>. Seus dados ficam criptografados com a sua senha e
+    separados dos outros perfis. O app se bloqueia sozinho depois de 5 minutos fora dele.
+    <button class="btn ghost" data-act="lock">🔒 Bloquear / trocar de perfil</button>
+    <button class="btn ghost" data-act="chpass" style="margin-top:10px">Mudar minha senha</button>
+  </div>
   <h2>Seus dados</h2>
-  <div class="card small muted">Tudo fica salvo só neste celular. Faça um backup de vez em quando.
+  <div class="card small muted">Tudo fica salvo só neste celular. Faça um backup de vez em quando —
+    o arquivo de backup <b>não</b> tem senha, então guarde-o num lugar seguro.
     <button class="btn ghost" data-act="export">Baixar backup</button>
     <button class="btn ghost" data-act="import" style="margin-top:10px">Importar arquivo / restaurar backup</button>
-    <button class="btn danger" data-act="reset" style="margin-top:10px">Apagar tudo e recomeçar</button>
+    <button class="btn danger" data-act="reset" style="margin-top:10px">Apagar meus dados e recomeçar</button>
+    <button class="btn danger" data-act="delprofile" style="margin-top:10px">Excluir meu perfil</button>
   </div>`;
 }
 
@@ -1050,8 +1243,11 @@ document.addEventListener('click', (e) => {
     case 'export': exportData(); break;
     case 'import': importData(); break;
     case 'reset':
-      if (confirm('Apagar TODOS os dados deste app? Isso não pode ser desfeito.')) { localStorage.removeItem(KEY); S = load(); ui.tab = 'home'; render(); }
+      if (confirm(`Apagar TODOS os dados do perfil ${session.profile.name} e recomeçar? Isso não pode ser desfeito. Os outros perfis não são afetados.`)) { S = blank(); save(); ui.tab = 'home'; render(); }
       break;
+    case 'lock': lockApp(); break;
+    case 'chpass': changePassSheet(); break;
+    case 'delprofile': deleteProfileSheet(); break;
   }
 });
 document.addEventListener('change', (e) => {
